@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import base64
 import os
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from hermes_voice_bridge.hermes import HermesClient, HermesError, limit_spoken_r
 from hermes_voice_bridge.server import (
     BridgeApplication,
     public_upstream_error,
+    validated_image,
     validated_text,
 )
 from hermes_voice_bridge.speech import SpeechError, SpeechService
@@ -78,6 +80,26 @@ class HermesClientTests(unittest.TestCase):
         self.assertIn("natural English", self.requests[1][2]["instructions"])
         self.assertIn("natural French", self.requests[2][2]["instructions"])
 
+    def test_image_turn_sends_multimodal_message(self):
+        jpeg = b"\xff\xd8\xff\xe0fake-jpeg"
+        reply, _ = self.client.turn("What is this?", language="en", image_jpeg=jpeg)
+        self.assertEqual(reply, "A sourced answer.")
+        body = self.requests[-1][2]
+        text_part, image_part = body["message"]
+        self.assertEqual(text_part, {"type": "text", "text": "What is this?"})
+        self.assertEqual(image_part["type"], "image_url")
+        self.assertEqual(
+            image_part["image_url"]["url"],
+            "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii"),
+        )
+        self.assertIn("glasses camera", body["instructions"])
+
+    def test_text_turn_message_stays_a_string(self):
+        self.client.turn("Plain question", language="en")
+        body = self.requests[-1][2]
+        self.assertEqual(body["message"], "Plain question")
+        self.assertNotIn("glasses camera", body["instructions"])
+
     def test_spoken_reply_is_enforced_server_side(self):
         reply = limit_spoken_reply("word " * 80)
         self.assertLessEqual(len(reply), 240)
@@ -91,6 +113,19 @@ class PublicReleaseTests(unittest.TestCase):
             validated_text("   ", 10)
         with self.assertRaisesRegex(ValueError, "too long"):
             validated_text("123456", 5)
+
+    def test_image_input_is_validated(self):
+        jpeg = b"\xff\xd8\xff\xe0" + b"x" * 100
+        self.assertIsNone(validated_image(None, 1_000))
+        self.assertEqual(validated_image(base64.b64encode(jpeg).decode(), 1_000), jpeg)
+        with self.assertRaisesRegex(ValueError, "JPEG"):
+            validated_image(base64.b64encode(b"\x89PNG\r\n\x1a\n").decode(), 1_000)
+        with self.assertRaisesRegex(ValueError, "base64"):
+            validated_image("not base64!", 1_000)
+        with self.assertRaisesRegex(ValueError, "too large"):
+            validated_image(base64.b64encode(jpeg).decode(), 50)
+        with self.assertRaisesRegex(ValueError, "base64 JPEG string"):
+            validated_image(123, 1_000)
 
     def test_expensive_work_has_a_bounded_concurrency_gate(self):
         with tempfile.TemporaryDirectory() as temp:

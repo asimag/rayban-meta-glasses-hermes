@@ -35,6 +35,7 @@ class Settings:
     max_concurrent_requests: int
     max_text_chars: int
     voices: dict[str, str]
+    max_image_bytes: int = 3_000_000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -61,6 +62,7 @@ class Settings:
                 "hi": os.environ.get("TTS_VOICE_HI", "Lekha").strip(),
                 "fr": os.environ.get("TTS_VOICE_FR", "Thomas").strip(),
             },
+            max_image_bytes=_positive_int("MAX_IMAGE_BYTES", 3_000_000),
         )
 
     def validate(self) -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +32,28 @@ def validated_text(value: object, max_chars: int) -> str:
     if len(text) > max_chars:
         raise ValueError(f"text is too long (maximum {max_chars} characters)")
     return text
+
+
+DEFAULT_IMAGE_QUESTION = "Briefly describe what I'm looking at."
+
+
+def validated_image(value: object, max_bytes: int) -> bytes | None:
+    """Decode an optional base64 JPEG from the glasses; anything else is rejected."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("image must be a base64 JPEG string")
+    if len(value) > (max_bytes * 4) // 3 + 4:
+        raise ValueError(f"image is too large (maximum {max_bytes} bytes)")
+    try:
+        image = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("image must be valid base64") from exc
+    if len(image) > max_bytes:
+        raise ValueError(f"image is too large (maximum {max_bytes} bytes)")
+    if not image.startswith(b"\xff\xd8\xff"):
+        raise ValueError("image must be a JPEG")
+    return image
 
 
 class BridgeApplication:
@@ -76,9 +100,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
         return False
 
-    def _read_json(self) -> dict:
+    def _read_json(self, max_bytes: int = 1_000_000) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > 1_000_000:
+        if length <= 0 or length > max_bytes:
             raise ValueError("invalid request size")
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
         if not isinstance(payload, dict):
@@ -139,14 +163,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/v1/turn":
-                payload = self._read_json()
-                text = validated_text(
-                    payload.get("text"), self.app.settings.max_text_chars
-                )
+                max_image = self.app.settings.max_image_bytes
+                # Base64 grows the image by a third; leave room for the text fields.
+                payload = self._read_json(max_bytes=(max_image * 4) // 3 + 1_000_000)
+                image = validated_image(payload.get("image"), max_image)
+                if image is not None and not str(payload.get("text") or "").strip():
+                    text = DEFAULT_IMAGE_QUESTION
+                else:
+                    text = validated_text(
+                        payload.get("text"), self.app.settings.max_text_chars
+                    )
                 language = normalize_language(payload.get("language"))
                 session_value = payload.get("session_id")
                 session_id = str(session_value).strip() if session_value else None
-                reply, session_id = self.app.hermes.turn(text, session_id, language)
+                reply, session_id = self.app.hermes.turn(
+                    text, session_id, language, image_jpeg=image
+                )
                 response = {
                     "session_id": session_id,
                     "language": language,

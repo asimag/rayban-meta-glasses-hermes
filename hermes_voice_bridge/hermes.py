@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import urllib.error
 import urllib.request
@@ -73,21 +74,40 @@ class HermesClient:
         return str(payload.get("session", {}).get("id") or session_id)
 
     def turn(
-        self, text: str, session_id: str | None = None, language: str = "en"
+        self,
+        text: str,
+        session_id: str | None = None,
+        language: str = "en",
+        image_jpeg: bytes | None = None,
     ) -> tuple[str, str]:
         current_session = session_id or self.create_session()
         try:
             language_instruction = LANGUAGE_INSTRUCTIONS[language]
         except KeyError as exc:
             raise ValueError(f"unsupported Hermes response language: {language}") from exc
+        message: str | list[dict] = text
+        image_instruction = ""
+        if image_jpeg is not None:
+            encoded = base64.b64encode(image_jpeg).decode("ascii")
+            message = [
+                {"type": "text", "text": text},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                },
+            ]
+            image_instruction = (
+                "The attached photo was just taken by the wearer's glasses camera and shows "
+                "what they are looking at; answer from it. "
+            )
         payload = self._request(
             "POST",
             f"/api/sessions/{current_session}/chat",
             {
-                "message": text,
+                "message": message,
                 "instructions": (
                     "You are answering a spoken question for a hands-free glasses client. "
-                    f"{language_instruction} "
+                    f"{image_instruction}{language_instruction} "
                     "HARD LIMIT: answer in at most two sentences and under 240 characters. "
                     "Every character is spoken aloud by a slow voice synthesiser, so length is "
                     "latency the wearer physically waits through. Lead with the single most "
