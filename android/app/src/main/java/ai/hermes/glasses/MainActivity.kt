@@ -3,6 +3,8 @@ package ai.hermes.glasses
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
+import android.os.SystemClock
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
@@ -10,11 +12,13 @@ import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
 import android.text.InputType
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -23,6 +27,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import ai.hermes.glasses.camera.GlassesPhotoCapture
+import ai.hermes.glasses.camera.PhotoEncoding
+import com.meta.wearable.dat.camera.photo.types.PhotoQuality
+import com.meta.wearable.dat.camera.photo.types.PhotoResolution
 import ai.hermes.glasses.interaction.TapToTalkEffect
 import ai.hermes.glasses.interaction.TapToTalkEvent
 import ai.hermes.glasses.interaction.TapToTalkState
@@ -52,6 +60,7 @@ import com.meta.wearable.dat.speech.types.SpeechState
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -73,6 +82,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var wakeButton: Button
     private lateinit var registrationButton: Button
     private lateinit var updateAppButton: Button
+    private lateinit var photoButton: Button
+    private lateinit var photoPreview: ImageView
 
     private var datInitialized = false
     private var deviceSession: DeviceSession? = null
@@ -80,6 +91,7 @@ class MainActivity : ComponentActivity() {
     private var inputs: Inputs? = null
     private var sessionJob: Job? = null
     private var speechJobs = mutableListOf<Job>()
+    private val inputJobs = mutableListOf<Job>()
     private var player: MediaPlayer? = null
     private var toneGenerator: ToneGenerator? = null
     private var rearmJob: Job? = null
@@ -90,6 +102,8 @@ class MainActivity : ComponentActivity() {
     private var restartSpeechWhenStopped = false
     private var wakeServiceRunning = false
     private var rapidRecognizerStops = 0
+    private var reconnectJob: Job? = null
+    private var reconnectAttempts = 0
 
     /** Pure idle/listening/busy transitions live here; see ai.hermes.glasses.interaction. */
     private val tapToTalk = TapToTalkStateMachine()
@@ -114,6 +128,14 @@ class MainActivity : ComponentActivity() {
             }.onFailure { error, _ -> showStatus("Permission error: ${error.description}") }
         }
 
+    private val datCameraPermission =
+        registerForActivityResult(Wearables.RequestPermissionContract()) { result ->
+            result.onSuccess { permission ->
+                if (permission == PermissionStatus.Granted) showStatus("Camera allowed. Ask again to use it.")
+                else showStatus("Meta AI camera permission was not granted")
+            }.onFailure { error, _ -> showStatus("Permission error: ${error.description}") }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = SecureSettings(this)
@@ -121,6 +143,9 @@ class MainActivity : ComponentActivity() {
         populateSettings()
         wireActions()
         toneGenerator = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 70) }.getOrNull()
+        // DAT leaves photos it received for an abandoned capture here; nothing transfers before init.
+        File(filesDir, "recv/dat").listFiles()?.forEach(File::delete)
+        File(filesDir, "photo-test").deleteRecursively()
         if (settings.wakeEnabled) dispatch(TapToTalkEvent.EnableWake) else updateInteractionUi()
         ensureBluetoothThenInitialize()
         lifecycleScope.launch {
@@ -140,7 +165,9 @@ class MainActivity : ComponentActivity() {
         toneGenerator?.release()
         toneGenerator = null
         speechJobs.forEach(Job::cancel)
+        inputJobs.forEach(Job::cancel)
         rearmJob?.cancel()
+        reconnectJob?.cancel()
         questionTimerJob?.cancel()
         sessionJob?.cancel()
         if (isFinishing) {
@@ -225,6 +252,8 @@ class MainActivity : ComponentActivity() {
         Wearables.createSession(AutoDeviceSelector()).fold(
             onSuccess = { created ->
                 deviceSession = created
+                // Collectors of a previous, stopped session would otherwise pile up on reconnects.
+                sessionJob?.cancel()
                 sessionJob = lifecycleScope.launch {
                     launch {
                         created.errors.collect { error -> handleGlassesError(error.description) }
@@ -234,6 +263,7 @@ class MainActivity : ComponentActivity() {
                             showStatus("Glasses session: ${state.name.lowercase()}")
                             when (state) {
                                 DeviceSessionState.STARTED -> {
+                                    reconnectAttempts = 0
                                     attachSpeech(created)
                                     attachInputs(created)
                                 }
@@ -242,6 +272,7 @@ class MainActivity : ComponentActivity() {
                                     speech = null
                                     deviceSession = null
                                     dispatch(TapToTalkEvent.Disconnected)
+                                    scheduleReconnect()
                                 }
                                 else -> Unit
                             }
@@ -253,8 +284,31 @@ class MainActivity : ComponentActivity() {
                 // afterwards on `created.state`, which the collector above is watching.
                 created.start()
             },
-            onFailure = { error, _ -> showStatus("Could not create glasses session: ${error.description}") },
+            onFailure = { error, _ ->
+                showStatus("Could not create glasses session: ${error.description}")
+                scheduleReconnect()
+            },
         )
+    }
+
+    /**
+     * While wake-up is on, reconnect after the glasses end the session. A touchpad double tap
+     * does that (and a single tap pauses it), as do folding or taking off the glasses; without
+     * this, standby stays deaf until the wearer reconnects in the app. Backs off up to a minute.
+     */
+    private fun scheduleReconnect() {
+        if (!tapToTalk.wakeEnabled || isFinishing || reconnectJob?.isActive == true) return
+        val delayMs = RECONNECT_DELAYS_MS[reconnectAttempts.coerceAtMost(RECONNECT_DELAYS_MS.lastIndex)]
+        reconnectAttempts++
+        showStatus("Glasses disconnected; reconnecting in ${delayMs / 1000} s")
+        reconnectJob = lifecycleScope.launch {
+            delay(delayMs)
+            if (tapToTalk.wakeEnabled && deviceSession == null &&
+                Wearables.registrationState.value == RegistrationState.REGISTERED
+            ) {
+                requestSpeechPermission()
+            }
+        }
     }
 
     private fun attachSpeech(session: DeviceSession) {
@@ -326,7 +380,7 @@ class MainActivity : ComponentActivity() {
             onSuccess = { attached ->
                 inputs = attached
                 var reachedActive = false
-                speechJobs += lifecycleScope.launch {
+                inputJobs += lifecycleScope.launch {
                     attached.state.collect { state ->
                         when (state) {
                             InputsState.ACTIVE -> reachedActive = true
@@ -341,12 +395,12 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-                speechJobs += lifecycleScope.launch {
+                inputJobs += lifecycleScope.launch {
                     attached.errors.collect { error ->
                         if (error != null) handleGlassesError(error.description)
                     }
                 }
-                speechJobs += lifecycleScope.launch {
+                inputJobs += lifecycleScope.launch {
                     attached.events.collect { event ->
                         // The action button surfaces as InputEvent.Button with
                         // ButtonType.ACTION (per the DAT 1.0 ButtonType docs: captouch nav/select
@@ -370,6 +424,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun detachInputs(session: DeviceSession) {
+        inputJobs.forEach(Job::cancel)
+        inputJobs.clear()
         inputs = null
         runCatching { session.removeInputs() }
     }
@@ -493,7 +549,7 @@ class MainActivity : ComponentActivity() {
                 // Leave room in the session for a whole question before the ~60 s cutoff.
                 TapToTalkEffect.StartListening -> ensureFreshSpeech(CAPTURE_MAX_SESSION_MS)
                 TapToTalkEffect.StopListening -> stopSpeech()
-                is TapToTalkEffect.Submit -> handleSubmitEffect(effect.text)
+                is TapToTalkEffect.Submit -> handleSubmitEffect(effect.text, effect.withImage)
                 TapToTalkEffect.PlayReadyCue -> playCue(ToneGenerator.TONE_PROP_ACK)
                 TapToTalkEffect.PlayCapturedCue -> playCue(ToneGenerator.TONE_PROP_BEEP)
                 TapToTalkEffect.PlayCancelCue -> playCue(ToneGenerator.TONE_PROP_NACK)
@@ -515,6 +571,7 @@ class MainActivity : ComponentActivity() {
     private fun updateInteractionUi() {
         val state = tapToTalk.state
         sendButton.isEnabled = state != TapToTalkState.BUSY
+        photoButton.isEnabled = state != TapToTalkState.BUSY
         listenButton.text = when (state) {
             TapToTalkState.IDLE, TapToTalkState.STANDBY -> "Start glasses listening"
             TapToTalkState.LISTENING -> "Listening on glasses (tap again to cancel)"
@@ -542,7 +599,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun handleSubmitEffect(text: String) {
+    private fun handleSubmitEffect(text: String, withImage: Boolean) {
         val question = text.trim()
         if (question.isEmpty()) {
             showStatus("Nothing to ask Hermes")
@@ -563,13 +620,16 @@ class MainActivity : ComponentActivity() {
             return
         }
         saveSettings(normalizedUrl, key)
-        showStatus("Asking Hermes… cloned speech can take several seconds")
         lifecycleScope.launch {
             try {
+                val image = if (withImage) takePhotoForQuestion() ?: return@launch else null
+                showStatus(if (image != null) "Asking Hermes about the photo…" else "Asking Hermes… cloned speech can take several seconds")
                 val client = HermesBridgeClient(normalizedUrl, key)
+                val askedAt = SystemClock.elapsedRealtime()
                 val response = withContext(Dispatchers.IO) {
-                    client.turn(question, selectedLanguage(), settings.sessionId)
+                    client.turn(question, selectedLanguage(), settings.sessionId, image)
                 }
+                if (image != null) Log.i(PHOTO_LOG_TAG, "Hermes answered in ${SystemClock.elapsedRealtime() - askedAt} ms")
                 settings.sessionId = response.sessionId
                 answer.text = "Hermes: ${response.text}"
                 if (response.audioPath != null) {
@@ -585,6 +645,62 @@ class MainActivity : ComponentActivity() {
                 showStatus(error.message ?: "Hermes request failed")
                 dispatch(TapToTalkEvent.ResponseFailed)
             }
+        }
+    }
+
+    /**
+     * Takes the photo for a visual question, or reports why not and ends the turn (returns null).
+     * The photo is kept in memory only: shown as a preview and sent once as JPEG.
+     */
+    private suspend fun takePhotoForQuestion(): ByteArray? {
+        val session = deviceSession?.takeIf { it.state.value == DeviceSessionState.STARTED }
+        if (session == null) {
+            showStatus("Connect the glasses to take a photo")
+            dispatch(TapToTalkEvent.ResponseFailed)
+            return null
+        }
+        val permission = Wearables.checkPermissionStatus(DatPermission.CAMERA).fold(
+            onSuccess = { it },
+            onFailure = { error, _ ->
+                showStatus("Camera permission check failed: ${error.description}")
+                null
+            },
+        )
+        if (permission != PermissionStatus.Granted) {
+            if (permission != null) datCameraPermission.launch(DatPermission.CAMERA)
+            dispatch(TapToTalkEvent.ResponseFailed)
+            return null
+        }
+        val startedAt = SystemClock.elapsedRealtime()
+        showStatus("Taking photo on glasses…")
+        return try {
+            val photo = GlassesPhotoCapture.capture(session, PHOTO_RESOLUTION, PHOTO_QUALITY) { fraction ->
+                showStatus("Receiving photo… ${(fraction * 100).toInt()}%")
+            }
+            playCue(ToneGenerator.TONE_PROP_BEEP2)
+            val jpeg = withContext(Dispatchers.Default) { PhotoEncoding.toJpeg(photo.imageData) }
+            val preview = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+            photoPreview.setImageBitmap(preview)
+            photoPreview.visibility = View.VISIBLE
+            Log.i(
+                PHOTO_LOG_TAG,
+                "photo ${photo.imageData.size / 1024} KB HEIC → ${jpeg.size / 1024} KB JPEG " +
+                    "${preview?.width}×${preview?.height}; capture ${photo.captureMs} ms, " +
+                    "total ${SystemClock.elapsedRealtime() - startedAt} ms, stale skipped ${photo.staleSkipped}",
+            )
+            jpeg
+        } catch (error: TimeoutCancellationException) {
+            Log.w(PHOTO_LOG_TAG, "photo timed out")
+            showStatus("The glasses photo timed out")
+            playCue(ToneGenerator.TONE_PROP_NACK)
+            dispatch(TapToTalkEvent.ResponseFailed)
+            null
+        } catch (error: Exception) {
+            Log.w(PHOTO_LOG_TAG, "photo failed: ${error.message}")
+            showStatus(error.message ?: "The glasses photo failed")
+            playCue(ToneGenerator.TONE_PROP_NACK)
+            dispatch(TapToTalkEvent.ResponseFailed)
+            null
         }
     }
 
@@ -663,6 +779,10 @@ class MainActivity : ComponentActivity() {
         wakeButton.setOnClickListener { toggleWake() }
         sendButton.setOnClickListener { dispatch(TapToTalkEvent.ManualSubmit(prompt.text.toString())) }
         updateAppButton.setOnClickListener { Wearables.openDATGlassesAppUpdate(this) }
+        photoButton.setOnClickListener {
+            val typed = prompt.text.toString().trim()
+            dispatch(TapToTalkEvent.ManualSubmit(typed.ifEmpty { DEFAULT_LOOK_QUESTION }, withImage = true))
+        }
         findViewById<Button>(R.id.test_bridge).setOnClickListener { testBridge() }
         findViewById<Button>(R.id.clear_session).setOnClickListener {
             settings.clearSession()
@@ -730,6 +850,13 @@ class MainActivity : ComponentActivity() {
         content.addView(prompt)
         sendButton = Button(this).apply { text = "Ask Hermes" }
         content.addView(sendButton, rowParams())
+        photoButton = Button(this).apply { text = "Look: ask Hermes about what I see" }
+        content.addView(photoButton, rowParams())
+        photoPreview = ImageView(this).apply {
+            adjustViewBounds = true
+            visibility = View.GONE
+        }
+        content.addView(photoPreview, rowParams())
         content.addView(Button(this).apply { id = R.id.clear_session; text = "New conversation" }, rowParams())
 
         answer = label("Hermes's answer will appear here.").apply { textSize = 18f }
@@ -772,5 +899,12 @@ class MainActivity : ComponentActivity() {
         const val RAPID_STOP_MS = 1_500L
         const val MAX_RAPID_STOPS = 5
         const val QUESTION_SILENCE_MS = 8_000L
+        const val PHOTO_LOG_TAG = "HermesPhoto"
+        val RECONNECT_DELAYS_MS = longArrayOf(3_000, 5_000, 10_000, 30_000, 60_000)
+
+        /** 720×1280, about 140 KB HEIC: about 5 s over the glasses' Bluetooth link (Phase 0). */
+        val PHOTO_RESOLUTION = PhotoResolution.MEDIUM
+        val PHOTO_QUALITY = PhotoQuality.MEDIUM
+        const val DEFAULT_LOOK_QUESTION = "What am I looking at?"
     }
 }

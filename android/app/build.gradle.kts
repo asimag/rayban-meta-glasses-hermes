@@ -53,6 +53,7 @@ dependencies {
     implementation("com.meta.wearable:mwdat-core:1.0.0")
     implementation("com.meta.wearable:mwdat-speech:1.0.0")
     implementation("com.meta.wearable:mwdat-inputs:1.0.0")
+    implementation("com.meta.wearable:mwdat-camera:1.0.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
     testImplementation("junit:junit:4.13.2")

@@ -26,8 +26,8 @@ sealed class TapToTalkEvent {
     /** Glasses disconnected/folded, or the DeviceSession stopped. */
     object Disconnected : TapToTalkEvent()
 
-    /** The phone button or typed-question fallback was used directly. */
-    data class ManualSubmit(val text: String) : TapToTalkEvent()
+    /** The phone button or typed-question fallback was used directly; [withImage] is the Look button. */
+    data class ManualSubmit(val text: String, val withImage: Boolean = false) : TapToTalkEvent()
 
     /** A recognizer is attached and can be armed for wake standby. */
     object SpeechReady : TapToTalkEvent()
@@ -49,7 +49,8 @@ sealed class TapToTalkEvent {
 sealed class TapToTalkEffect {
     object StartListening : TapToTalkEffect()
     object StopListening : TapToTalkEffect()
-    data class Submit(val text: String) : TapToTalkEffect()
+    /** Ask Hermes; with [withImage] the glasses take a photo first and send it with [text]. */
+    data class Submit(val text: String, val withImage: Boolean = false) : TapToTalkEffect()
     object PlayReadyCue : TapToTalkEffect()
     object PlayCapturedCue : TapToTalkEffect()
     object PlayCancelCue : TapToTalkEffect()
@@ -154,11 +155,11 @@ class TapToTalkStateMachine(private val wakePhrase: WakePhraseMatcher = WakePhra
         is TapToTalkEvent.ManualSubmit -> when (current) {
             TapToTalkState.BUSY -> current to emptyList()
             TapToTalkState.LISTENING ->
-                TapToTalkState.BUSY to listOf(TapToTalkEffect.StopListening, TapToTalkEffect.Submit(event.text))
+                TapToTalkState.BUSY to listOf(TapToTalkEffect.StopListening, TapToTalkEffect.Submit(event.text, event.withImage))
             TapToTalkState.STANDBY ->
-                TapToTalkState.BUSY to listOf(TapToTalkEffect.DisarmWake, TapToTalkEffect.Submit(event.text))
+                TapToTalkState.BUSY to listOf(TapToTalkEffect.DisarmWake, TapToTalkEffect.Submit(event.text, event.withImage))
             TapToTalkState.IDLE ->
-                TapToTalkState.BUSY to listOf(TapToTalkEffect.Submit(event.text))
+                TapToTalkState.BUSY to listOf(TapToTalkEffect.Submit(event.text, event.withImage))
         }
 
         is TapToTalkEvent.SpeechReady -> {
@@ -241,7 +242,10 @@ class TapToTalkStateMachine(private val wakePhrase: WakePhraseMatcher = WakePhra
         text: String,
         before: List<TapToTalkEffect>,
     ): Pair<TapToTalkState, List<TapToTalkEffect>> =
-        TapToTalkState.BUSY to before + listOf(TapToTalkEffect.Submit(text), TapToTalkEffect.PlayCapturedCue)
+        TapToTalkState.BUSY to before + listOf(
+            TapToTalkEffect.Submit(text, withImage = VisualIntent.matches(text)),
+            TapToTalkEffect.PlayCapturedCue,
+        )
 
     private fun restingState(): TapToTalkState =
         if (wakeEnabled && recognizerReady) TapToTalkState.STANDBY else TapToTalkState.IDLE

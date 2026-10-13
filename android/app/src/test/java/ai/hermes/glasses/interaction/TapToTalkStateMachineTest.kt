@@ -438,4 +438,29 @@ class TapToTalkStateMachineTest {
         machine.on(TapToTalkEvent.FinalTranscript("Hey Hermes, stop the timer"))
         assertEquals(TapToTalkState.BUSY, machine.state)
     }
+
+    @Test
+    fun visualVoiceQuestionAsksForAPhoto() {
+        val machine = TapToTalkStateMachine()
+        machine.on(TapToTalkEvent.TriggerPressed)
+        val effects = machine.on(TapToTalkEvent.FinalTranscript("What am I looking at?"))
+        assertEquals(
+            listOf(TapToTalkEffect.Submit("What am I looking at?", withImage = true), TapToTalkEffect.PlayCapturedCue),
+            effects,
+        )
+    }
+
+    @Test
+    fun lookButtonSubmitsWithImageAndTypedQuestionsDoNot() {
+        val machine = TapToTalkStateMachine()
+        assertEquals(
+            listOf(TapToTalkEffect.Submit("what is this", withImage = true)),
+            machine.on(TapToTalkEvent.ManualSubmit("what is this", withImage = true)),
+        )
+        machine.on(TapToTalkEvent.ResponseFinished)
+        assertEquals(
+            listOf(TapToTalkEffect.Submit("what is this")),
+            machine.on(TapToTalkEvent.ManualSubmit("what is this")),
+        )
+    }
 }

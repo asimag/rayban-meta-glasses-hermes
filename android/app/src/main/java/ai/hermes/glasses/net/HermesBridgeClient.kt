@@ -3,6 +3,7 @@ package ai.hermes.glasses.net
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Base64
 import org.json.JSONObject
 
 data class TurnResponse(
@@ -26,13 +27,15 @@ class HermesBridgeClient(
         }
     }
 
-    fun turn(text: String, language: String, sessionId: String?): TurnResponse {
+    /** [imageJpeg], when present, is the glasses photo the question is about. */
+    fun turn(text: String, language: String, sessionId: String?, imageJpeg: ByteArray? = null): TurnResponse {
         require(apiKey.isNotBlank()) { "Enter the bridge API key" }
         val payload = JSONObject()
             .put("text", text)
             .put("language", language)
             .put("speak", true)
         if (!sessionId.isNullOrBlank()) payload.put("session_id", sessionId)
+        if (imageJpeg != null) payload.put("image", Base64.getEncoder().encodeToString(imageJpeg))
 
         val connection = open("/v1/turn", "POST", authenticated = true)
         connection.doOutput = true

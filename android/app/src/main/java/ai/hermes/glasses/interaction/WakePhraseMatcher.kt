@@ -91,4 +91,4 @@ private val MARKS = Regex("\\p{Mn}+")
 private fun fold(word: String): String =
     Normalizer.normalize(word.lowercase(), Normalizer.Form.NFD).replace(MARKS, "").replace("'", "")
 
-private fun foldedWords(text: String): List<String> = WORD.findAll(text).map { fold(it.value) }.toList()
+internal fun foldedWords(text: String): List<String> = WORD.findAll(text).map { fold(it.value) }.toList()
