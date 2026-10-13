@@ -22,6 +22,10 @@ class SecureSettings(context: Context) {
         get() = preferences.getString(LANGUAGE_KEY, "en") ?: "en"
         set(value) = preferences.edit { putString(LANGUAGE_KEY, value) }
 
+    var wakeEnabled: Boolean
+        get() = preferences.getBoolean(WAKE_KEY, false)
+        set(value) = preferences.edit { putBoolean(WAKE_KEY, value) }
+
     var sessionId: String?
         get() = preferences.getString(SESSION_KEY, null)
         set(value) = preferences.edit { putString(SESSION_KEY, value) }
@@ -78,6 +82,7 @@ class SecureSettings(context: Context) {
         private const val URL_KEY = "bridge_url"
         private const val LANGUAGE_KEY = "language"
         private const val SESSION_KEY = "session_id"
+        private const val WAKE_KEY = "voice_wake_enabled"
         private const val API_KEY = "api_key_ciphertext"
         private const val API_IV = "api_key_iv"
         private const val KEY_ALIAS = "hermes_bridge_api_key"

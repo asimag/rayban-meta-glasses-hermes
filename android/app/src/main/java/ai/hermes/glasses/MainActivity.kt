@@ -37,6 +37,7 @@ import com.meta.wearable.dat.core.session.DeviceSessionState
 import com.meta.wearable.dat.core.types.Permission as DatPermission
 import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
+import com.meta.wearable.dat.core.types.WearablesError
 import com.meta.wearable.dat.inputs.Inputs
 import com.meta.wearable.dat.inputs.addInputs
 import com.meta.wearable.dat.inputs.removeInputs
@@ -51,6 +52,7 @@ import com.meta.wearable.dat.speech.types.SpeechState
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -68,6 +70,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var answer: TextView
     private lateinit var sendButton: Button
     private lateinit var listenButton: Button
+    private lateinit var wakeButton: Button
     private lateinit var registrationButton: Button
     private lateinit var updateAppButton: Button
 
@@ -79,12 +82,28 @@ class MainActivity : ComponentActivity() {
     private var speechJobs = mutableListOf<Job>()
     private var player: MediaPlayer? = null
     private var toneGenerator: ToneGenerator? = null
+    private var rearmJob: Job? = null
+    private var questionTimerJob: Job? = null
+    private var questionTimerId: Int? = null
+    private var lastArmAt = 0L
+    private var speechStartedAt = 0L
+    private var restartSpeechWhenStopped = false
+    private var wakeServiceRunning = false
+    private var rapidRecognizerStops = 0
 
     /** Pure idle/listening/busy transitions live here; see ai.hermes.glasses.interaction. */
     private val tapToTalk = TapToTalkStateMachine()
 
     private val bluetoothPermission = registerForActivityResult(RequestPermission()) { granted ->
         if (granted) initializeDat() else showStatus("Bluetooth permission is required for the glasses")
+    }
+
+    /**
+     * Without it the wake-up notification is hidden, but the service still runs. A notification
+     * posted while denied is not shown after a later grant, so have the service post it again.
+     */
+    private val notificationPermission = registerForActivityResult(RequestPermission()) { granted ->
+        if (granted && wakeServiceRunning) runCatching { WakeListeningService.start(this) }
     }
 
     private val datMicrophonePermission =
@@ -102,8 +121,17 @@ class MainActivity : ComponentActivity() {
         populateSettings()
         wireActions()
         toneGenerator = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 70) }.getOrNull()
-        updateInteractionUi()
+        if (settings.wakeEnabled) dispatch(TapToTalkEvent.EnableWake) else updateInteractionUi()
         ensureBluetoothThenInitialize()
+        lifecycleScope.launch {
+            WakeListeningService.stopRequested.collect { dispatch(TapToTalkEvent.DisableWake) }
+        }
+        lifecycleScope.launch {
+            while (true) {
+                delay(SPEECH_WATCHDOG_MS)
+                if (tapToTalk.state == TapToTalkState.STANDBY) ensureFreshSpeech(STANDBY_MAX_SESSION_MS)
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -112,8 +140,11 @@ class MainActivity : ComponentActivity() {
         toneGenerator?.release()
         toneGenerator = null
         speechJobs.forEach(Job::cancel)
+        rearmJob?.cancel()
+        questionTimerJob?.cancel()
         sessionJob?.cancel()
         if (isFinishing) {
+            stopWakeService()
             deviceSession?.let { session ->
                 detachInputs(session)
                 session.stop()
@@ -136,21 +167,31 @@ class MainActivity : ComponentActivity() {
     private fun initializeDat() {
         if (datInitialized) return
         Wearables.initialize(applicationContext).fold(
-            onSuccess = {
-                datInitialized = true
-                showStatus("Meta toolkit ready")
-                lifecycleScope.launch {
-                    Wearables.registrationState.collect { state ->
-                        registrationButton.text = when (state) {
-                            RegistrationState.REGISTERED -> "Meta AI connected"
-                            RegistrationState.REGISTERING -> "Connecting to Meta AI…"
-                            else -> "Connect Meta glasses"
-                        }
-                    }
-                }
+            onSuccess = { onDatReady() },
+            onFailure = { error, _ ->
+                // Wearables is process-wide; a recreated Activity finds it already initialized.
+                if (error == WearablesError.ALREADY_INITIALIZED) onDatReady()
+                else showStatus("Meta toolkit error: ${error.description}")
             },
-            onFailure = { error, _ -> showStatus("Meta toolkit error: ${error.description}") },
         )
+    }
+
+    private fun onDatReady() {
+        datInitialized = true
+        showStatus("Meta toolkit ready")
+        lifecycleScope.launch {
+            Wearables.registrationState.collect { state ->
+                registrationButton.text = when (state) {
+                    RegistrationState.REGISTERED -> "Meta AI connected"
+                    RegistrationState.REGISTERING -> "Connecting to Meta AI…"
+                    else -> "Connect Meta glasses"
+                }
+                // With wake-up on, reconnect on launch so standby resumes without a tap.
+                if (state == RegistrationState.REGISTERED && tapToTalk.wakeEnabled && deviceSession == null) {
+                    requestSpeechPermission()
+                }
+            }
+        }
     }
 
     private fun connectGlasses() {
@@ -229,10 +270,36 @@ class MainActivity : ComponentActivity() {
                 speechJobs += lifecycleScope.launch {
                     attached.transcriptions.collect { result ->
                         if (result == null) return@collect
-                        transcript.text = if (result.isFinal) "You: ${result.text}" else "Hearing: ${result.text}"
-                        if (result.isFinal) dispatch(TapToTalkEvent.FinalTranscript(result.text))
+                        // Standby hears ordinary conversation; keep it off the screen.
+                        transcript.text = when {
+                            tapToTalk.state == TapToTalkState.STANDBY -> "Standby: listening for the wake phrase"
+                            result.isFinal -> "You: ${result.text}"
+                            else -> "Hearing: ${result.text}"
+                        }
+                        if (result.isFinal) {
+                            dispatch(TapToTalkEvent.FinalTranscript(result.text))
+                        } else if (tapToTalk.state == TapToTalkState.LISTENING && result.text.isNotBlank()) {
+                            // Still talking: the final only arrives once the question ends.
+                            questionTimerId?.let(::startQuestionTimer)
+                        }
                     }
                 }
+                speechJobs += lifecycleScope.launch {
+                    // DAT Speech is utterance-scoped: each completed utterance returns to STOPPED.
+                    // Only report real transitions, not the STOPPED value replayed on subscribe.
+                    var previous: SpeechState? = null
+                    attached.state.collect { state ->
+                        if (state == SpeechState.STOPPED && previous != null && previous != SpeechState.STOPPED) {
+                            if (restartSpeechWhenStopped) {
+                                restartSpeechWhenStopped = false
+                                startSpeech()
+                            }
+                            onRecognizerStopped()
+                        }
+                        previous = state
+                    }
+                }
+                dispatch(TapToTalkEvent.SpeechReady)
             },
             onFailure = { error, _ -> showStatus("Speech is unavailable: ${error.description}") },
         )
@@ -307,27 +374,136 @@ class MainActivity : ComponentActivity() {
         runCatching { session.removeInputs() }
     }
 
-    private fun startSpeechIfStopped() {
+    private fun startSpeech() {
         val activeSpeech = speech ?: return
         if (activeSpeech.state.value != SpeechState.STOPPED) return
-        activeSpeech.start().onFailure { error, _ -> showStatus("Could not start speech: ${error.description}") }
+        activeSpeech.start().fold(
+            onSuccess = { speechStartedAt = System.currentTimeMillis() },
+            onFailure = { error, _ -> showStatus("Could not start speech: ${error.description}") },
+        )
+    }
+
+    /**
+     * A DAT Speech session streams many utterances, then the glasses end it about 60 s after it
+     * started. The SDK (1.0.0) logs that completion but leaves `state` at STARTED, so a session
+     * cannot be seen to die. Restart any session older than [maxAgeMs] instead of trusting state.
+     */
+    private fun ensureFreshSpeech(maxAgeMs: Long) {
+        val activeSpeech = speech ?: return
+        when (activeSpeech.state.value) {
+            SpeechState.STOPPED -> startSpeech()
+            SpeechState.STARTED -> if (System.currentTimeMillis() - speechStartedAt >= maxAgeMs) {
+                restartSpeechWhenStopped = true
+                activeSpeech.stop()
+            }
+            SpeechState.STOPPING -> restartSpeechWhenStopped = true
+            else -> Unit
+        }
+    }
+
+    /**
+     * Times out a wake-started capture after [QUESTION_SILENCE_MS] with no speech. Partial
+     * transcripts restart it; on the glasses a whole question took 6–8 s to arrive as a final.
+     */
+    private fun startQuestionTimer(id: Int) {
+        questionTimerId = id
+        questionTimerJob?.cancel()
+        questionTimerJob = lifecycleScope.launch {
+            delay(QUESTION_SILENCE_MS)
+            questionTimerId = null
+            dispatch(TapToTalkEvent.QuestionTimeout(id))
+        }
+    }
+
+    private fun stopSpeech() {
+        restartSpeechWhenStopped = false
+        speech?.takeIf { it.state.value != SpeechState.STOPPED }?.stop()
+    }
+
+    /** A short delay lets a stopping session finish; its STOPPED transition re-arms again anyway. */
+    private fun scheduleRearm() {
+        rearmJob?.cancel()
+        rearmJob = lifecycleScope.launch {
+            delay(REARM_DELAY_MS)
+            if (tapToTalk.state != TapToTalkState.STANDBY) return@launch
+            lastArmAt = System.currentTimeMillis()
+            ensureFreshSpeech(STANDBY_MAX_SESSION_MS)
+        }
+    }
+
+    /** Stops that follow arming almost immediately mean the recognizer cannot stay up; stop looping. */
+    private fun onRecognizerStopped() {
+        if (tapToTalk.state == TapToTalkState.STANDBY) {
+            val rapid = System.currentTimeMillis() - lastArmAt < RAPID_STOP_MS
+            rapidRecognizerStops = if (rapid) rapidRecognizerStops + 1 else 0
+            if (rapidRecognizerStops >= MAX_RAPID_STOPS) {
+                rapidRecognizerStops = 0
+                showStatus("Wake standby stopped: glasses speech keeps ending immediately")
+                dispatch(TapToTalkEvent.RecognizerFailed)
+                return
+            }
+        }
+        dispatch(TapToTalkEvent.RecognizerStopped)
+    }
+
+    /** Started only from foreground paths (launch, the toggle); Android refuses it from the background. */
+    private fun startWakeService() {
+        if (wakeServiceRunning) return
+        // Wake-up is often already on from a saved setting, so ask here rather than on the toggle.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        runCatching { WakeListeningService.start(this) }
+            .onSuccess { wakeServiceRunning = true }
+            .onFailure { showStatus("Wake-up will stop when the phone locks: ${it.message}") }
+    }
+
+    private fun stopWakeService() {
+        if (!wakeServiceRunning) return
+        WakeListeningService.stop(this)
+        wakeServiceRunning = false
+    }
+
+    private fun toggleWake() {
+        val enable = !tapToTalk.wakeEnabled
+        settings.wakeEnabled = enable
+        if (enable) {
+            dispatch(TapToTalkEvent.EnableWake)
+            if (speech == null) connectGlasses()
+        } else {
+            dispatch(TapToTalkEvent.DisableWake)
+        }
     }
 
     /** Applies the effects of a tap-to-talk transition, then refreshes the UI to match. */
     private fun dispatch(event: TapToTalkEvent) {
         applyTapToTalkEffects(tapToTalk.on(event))
+        // "Stop listening" can turn wake-up off by voice; keep the saved toggle and service in step.
+        if (settings.wakeEnabled != tapToTalk.wakeEnabled) settings.wakeEnabled = tapToTalk.wakeEnabled
+        if (tapToTalk.wakeEnabled) startWakeService() else stopWakeService()
         updateInteractionUi()
     }
 
     private fun applyTapToTalkEffects(effects: List<TapToTalkEffect>) {
         effects.forEach { effect ->
             when (effect) {
-                TapToTalkEffect.StartListening -> startSpeechIfStopped()
-                TapToTalkEffect.StopListening -> speech?.stop()
+                // Leave room in the session for a whole question before the ~60 s cutoff.
+                TapToTalkEffect.StartListening -> ensureFreshSpeech(CAPTURE_MAX_SESSION_MS)
+                TapToTalkEffect.StopListening -> stopSpeech()
                 is TapToTalkEffect.Submit -> handleSubmitEffect(effect.text)
                 TapToTalkEffect.PlayReadyCue -> playCue(ToneGenerator.TONE_PROP_ACK)
                 TapToTalkEffect.PlayCapturedCue -> playCue(ToneGenerator.TONE_PROP_BEEP)
                 TapToTalkEffect.PlayCancelCue -> playCue(ToneGenerator.TONE_PROP_NACK)
+                TapToTalkEffect.PlayWakeCue -> playCue(ToneGenerator.TONE_PROP_BEEP2)
+                TapToTalkEffect.ArmWake -> scheduleRearm()
+                TapToTalkEffect.DisarmWake -> {
+                    rearmJob?.cancel()
+                    stopSpeech()
+                }
+                is TapToTalkEffect.StartQuestionTimer -> startQuestionTimer(effect.id)
             }
         }
     }
@@ -340,11 +516,16 @@ class MainActivity : ComponentActivity() {
         val state = tapToTalk.state
         sendButton.isEnabled = state != TapToTalkState.BUSY
         listenButton.text = when (state) {
-            TapToTalkState.IDLE -> "Start glasses listening"
+            TapToTalkState.IDLE, TapToTalkState.STANDBY -> "Start glasses listening"
             TapToTalkState.LISTENING -> "Listening on glasses (tap again to cancel)"
             TapToTalkState.BUSY -> "Asking Hermes…"
         }
-        interactionStatus.text = "Glasses state: ${state.name.lowercase()}"
+        wakeButton.text = if (tapToTalk.wakeEnabled) "Turn off voice wake-up" else "Turn on voice wake-up (experimental)"
+        interactionStatus.text = when {
+            state == TapToTalkState.STANDBY -> "Glasses state: standby — say “Hey Hermes”"
+            state == TapToTalkState.IDLE && tapToTalk.wakeEnabled -> "Glasses state: idle — wake-up waits for glasses speech"
+            else -> "Glasses state: ${state.name.lowercase()}"
+        }
     }
 
     private fun handleGlassesError(description: String) {
@@ -479,6 +660,7 @@ class MainActivity : ComponentActivity() {
         listenButton.setOnClickListener {
             if (speech == null) connectGlasses() else dispatch(TapToTalkEvent.TriggerPressed)
         }
+        wakeButton.setOnClickListener { toggleWake() }
         sendButton.setOnClickListener { dispatch(TapToTalkEvent.ManualSubmit(prompt.text.toString())) }
         updateAppButton.setOnClickListener { Wearables.openDATGlassesAppUpdate(this) }
         findViewById<Button>(R.id.test_bridge).setOnClickListener { testBridge() }
@@ -529,6 +711,8 @@ class MainActivity : ComponentActivity() {
         listenButton = Button(this).apply { text = "Start glasses listening" }
         content.addView(registrationButton, rowParams())
         content.addView(listenButton, rowParams())
+        wakeButton = Button(this).apply { text = "Turn on voice wake-up (experimental)" }
+        content.addView(wakeButton, rowParams())
 
         updateAppButton = Button(this).apply {
             text = "Update Meta AI app on glasses"
@@ -579,4 +763,14 @@ class MainActivity : ComponentActivity() {
     ).apply { topMargin = dp(10) }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private companion object {
+        const val REARM_DELAY_MS = 300L
+        const val SPEECH_WATCHDOG_MS = 5_000L
+        const val STANDBY_MAX_SESSION_MS = 50_000L
+        const val CAPTURE_MAX_SESSION_MS = 40_000L
+        const val RAPID_STOP_MS = 1_500L
+        const val MAX_RAPID_STOPS = 5
+        const val QUESTION_SILENCE_MS = 8_000L
+    }
 }
