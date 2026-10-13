@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import sys
 import tempfile
 import time
 import unittest
+import wave
 
 from hermes_voice_bridge.config import Settings, normalize_language
 from hermes_voice_bridge.hermes import HermesClient, HermesError, limit_spoken_reply
@@ -155,6 +157,19 @@ class SettingsTests(unittest.TestCase):
 
 
 class SpeechServiceTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS system speech")
+    def test_macos_speech_produces_android_compatible_pcm_wave(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = SpeechService(settings(), Path(temp) / "audio")
+            _, output, media_type = service.synthesize("Voice test.", "en")
+            self.assertEqual(media_type, "audio/wav")
+            with wave.open(str(output), "rb") as audio:
+                self.assertEqual(audio.getsampwidth(), 2)
+                self.assertEqual(audio.getframerate(), 44100)
+                self.assertEqual(audio.getcomptype(), "NONE")
+                self.assertGreater(audio.getnframes(), 0)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
     def test_audio_directory_is_private(self):
         with tempfile.TemporaryDirectory() as temp:
             audio_dir = Path(temp) / "audio"

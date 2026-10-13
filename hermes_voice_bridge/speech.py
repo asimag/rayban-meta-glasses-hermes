@@ -45,16 +45,18 @@ class SpeechService:
         self.cleanup()
         audio_id = uuid.uuid4().hex
         if self.settings.tts_provider == "macos":
-            output = self.audio_dir / f"{audio_id}.aiff"
+            output = self.audio_dir / f"{audio_id}.wav"
             command = [
                 "/usr/bin/say",
                 "-v",
                 self.settings.voices[language],
+                "--file-format=WAVE",
+                "--data-format=LEI16@44100",
                 "-o",
                 str(output),
                 text,
             ]
-            media_type = "audio/aiff"
+            media_type = "audio/wav"
         else:
             output = self.audio_dir / f"{audio_id}.wav"
             with tempfile.NamedTemporaryFile(
@@ -116,4 +118,3 @@ class SpeechService:
             if not transcript:
                 raise SpeechError("STT returned an empty transcript")
             return transcript
-
